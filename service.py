@@ -30,7 +30,8 @@ MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("MAX_CONCURRENT_SCANS", "2")))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SHA_RE = re.compile(r"^[a-f0-9]{64}$")
-ID_FIELDS = ("tenant", "site", "environment", "batch", "observation")
+ID_FIELDS = ("tenant", "site", "environment", "batch", "observation", "file_version")
+HEADER_FIELDS = {key: key.replace("_", "-").title() for key in ID_FIELDS}
 IMUNIFY_GROUP = os.environ.get("IMUNIFY_GROUP", "_imunify")
 
 
@@ -44,6 +45,130 @@ class ScannerBackend(Protocol):
     def scan(self, path: Path) -> dict[str, Any]: ...
 
 
+class ClamAvBackend:
+    def __init__(self, cli: str = "/usr/bin/clamdscan", timeout: int = SCAN_TIMEOUT_SECONDS):
+        self.cli = cli
+        self.timeout = timeout
+
+    def scan(self, path: Path) -> dict[str, Any]:
+        try:
+            completed = subprocess.run([self.cli, "--no-summary", "--infected", "--stdout", str(path)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendFailure("engine_timeout") from exc
+        except OSError as exc:
+            raise BackendFailure("engine_unavailable") from exc
+        if completed.returncode == 0:
+            if completed.stdout.strip():
+                raise BackendFailure("invalid_scanner_result")
+            return {"status": "clean", "findings": []}
+        if completed.returncode != 1:
+            raise BackendFailure("engine_scan_failed")
+        findings = []
+        for line in completed.stdout.splitlines():
+            prefix = str(path) + ": "
+            if line.startswith(prefix) and line.endswith(" FOUND"):
+                rule = line[len(prefix):-len(" FOUND")].strip()
+                if rule and len(rule) <= 256 and not any(ord(ch) < 32 for ch in rule):
+                    findings.append({"rule": rule, "severity": "unknown", "line": None})
+        if not findings:
+            raise BackendFailure("invalid_scanner_result")
+        return {"status": "infected", "findings": findings}
+
+
+class PhpMalwareScannerBackend:
+    def __init__(self, php: str, script: str, timeout: int = SCAN_TIMEOUT_SECONDS):
+        self.php = php
+        self.script = script
+        self.timeout = timeout
+
+    def scan(self, path: Path) -> dict[str, Any]:
+        if path.is_symlink() or not path.is_file():
+            raise BackendFailure("invalid_scan_path")
+        try:
+            completed = subprocess.run([self.php, self.script, "-d", str(path.parent), "-E", "-k", "-w",
+                "-n", "-s", "-L", "-o", "%S|%P|%L", "--disable-stats"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendFailure("engine_timeout") from exc
+        except OSError as exc:
+            raise BackendFailure("engine_unavailable") from exc
+        if completed.returncode != 0:
+            raise BackendFailure("engine_scan_failed")
+        findings = []
+        for output_line in completed.stdout.splitlines():
+            if not output_line:
+                continue
+            status, separator, rest = output_line.partition("|")
+            if not separator or status != "ER":
+                raise BackendFailure("invalid_scanner_result")
+            rule, separator, line_value = rest.rpartition("|")
+            if not separator:
+                raise BackendFailure("invalid_scanner_result")
+            rule = rule.strip()
+            if not rule or len(rule) > 256 or any(ord(ch) < 32 for ch in rule):
+                raise BackendFailure("invalid_scanner_result")
+            line_number = int(line_value) if line_value.isdigit() and int(line_value) > 0 else None
+            findings.append({"rule": rule, "severity": "unknown", "line": line_number})
+        return {"status": "infected" if findings else "clean", "findings": findings}
+
+
+class MultiEngineBackend:
+    def __init__(self, engines: dict[str, ScannerBackend], metadata: dict[str, dict[str, str | None]] | None = None):
+        self.engines = engines
+        self.metadata = metadata or {}
+
+    def scan(self, path: Path) -> dict[str, Any]:
+        results = []
+        for name, backend in self.engines.items():
+            started = time.monotonic()
+            try:
+                result = backend.scan(path)
+            except BackendFailure as exc:
+                result = {"status": "not_evaluated", "reason": exc.reason, "findings": []}
+            except Exception:
+                result = {"status": "not_evaluated", "reason": "engine_internal_error", "findings": []}
+            state = result.get("status")
+            status = {"clean": "no_findings", "infected": "findings"}.get(state, "not_evaluated")
+            findings = result.get("findings", [])
+            safe_findings = []
+            valid_findings = isinstance(findings, list)
+            for finding in findings if valid_findings else []:
+                if not isinstance(finding, dict) or not isinstance(finding.get("rule"), str) \
+                        or not finding["rule"] or len(finding["rule"]) > 256 \
+                        or any(ord(ch) < 32 for ch in finding["rule"]) \
+                        or finding.get("severity", "unknown") not in ("unknown", "info", "low", "medium", "high", "critical") \
+                        or (finding.get("line") is not None and (type(finding["line"]) is not int or finding["line"] < 1)):
+                    valid_findings = False
+                    break
+                safe_findings.append({"rule": finding["rule"], "severity": finding.get("severity", "unknown"),
+                                      "line": finding.get("line")})
+            if not valid_findings or (status == "no_findings" and safe_findings) \
+                    or (status == "findings" and not safe_findings):
+                status, findings = "not_evaluated", []
+            else:
+                findings = safe_findings
+            reason = result.get("reason") if status == "not_evaluated" else None
+            if reason is not None and (not isinstance(reason, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason)):
+                status, reason, findings = "not_evaluated", "invalid_scanner_result", []
+            metadata = self.metadata.get(name, {})
+            engine_version = result.get("engine_version") or metadata.get("engine_version")
+            signature_revision = result.get("signature_revision") or metadata.get("signature_revision")
+            engine_version = engine_version if isinstance(engine_version, str) and 0 < len(engine_version) <= 128 \
+                and all(32 <= ord(ch) < 127 for ch in engine_version) else None
+            signature_revision = signature_revision if isinstance(signature_revision, str) and 0 < len(signature_revision) <= 128 \
+                and all(32 <= ord(ch) < 127 for ch in signature_revision) else None
+            results.append({
+                "engine": name, "status": status,
+                "reason": reason,
+                "findings": findings,
+                "engine_version": engine_version,
+                "signature_revision": signature_revision,
+                "profile": "mama-node-v1", "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+            })
+        return {"results": results}
+
+
 def _event_findings(event: dict[str, Any]) -> list[dict[str, str]]:
     raw = event.get("malicious_files", event.get("files", []))
     if not isinstance(raw, list):
@@ -55,7 +180,7 @@ def _event_findings(event: dict[str, Any]) -> list[dict[str, str]]:
         rule = item.get("type")
         if not isinstance(rule, str) or not rule or len(rule) > 256:
             raise BackendFailure("invalid_scanner_result")
-        findings.append({"rule": rule})
+        findings.append({"rule": rule, "severity": "unknown", "line": None})
     return findings
 
 
@@ -178,8 +303,12 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
 
     request_dir: Path | None = None
     file_path: Path | None = None
-    result: dict[str, Any] = {"status": "not_evaluated", "reason": "engine_internal_error",
-                              "scan_id": None, "findings": []}
+    scanned: dict[str, Any] = {"results": []}
+    def failed_results(reason: str) -> list[dict[str, Any]]:
+        names = list(backend.engines) if isinstance(backend, MultiEngineBackend) else ["unknown"]
+        return [{"engine": name, "status": "not_evaluated", "reason": reason, "findings": [],
+                 "engine_version": None, "signature_revision": None, "profile": "mama-node-v1",
+                 "elapsed_ms": None} for name in names]
     try:
         request_dir = Path(tempfile.mkdtemp(prefix="scan-", dir=temp_root))
         _set_imunify_group(request_dir, 0o750)
@@ -190,15 +319,13 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
             output.flush()
             os.fsync(output.fileno())
         try:
-            result = backend.scan(file_path)
+            scanned = backend.scan(file_path)
         except BackendFailure as exc:
-            result = {"status": "not_evaluated", "reason": exc.reason,
-                      "scan_id": None, "findings": []}
+            scanned = {"results": failed_results(exc.reason)}
         except Exception:
             LOG.error("scanner_backend_internal_error request=%s sha256=%s",
                       identifiers["observation"], actual_sha)
-            result = {"status": "not_evaluated", "reason": "engine_internal_error",
-                      "scan_id": None, "findings": []}
+            scanned = {"results": failed_results("engine_internal_error")}
     finally:
         try:
             if file_path is not None:
@@ -208,24 +335,21 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
         except OSError:
             LOG.error("temporary_cleanup_failed request=%s sha256=%s",
                       identifiers["observation"], actual_sha)
-            result = {"status": "not_evaluated", "reason": "temporary_cleanup_failed",
-                      "scan_id": None, "findings": []}
+            scanned = {"results": failed_results("temporary_cleanup_failed")}
 
     payload = {
         **identifiers,
-        "engine": "imunifyav",
-        "status": result["status"],
-        "reason": result["reason"],
         "sha256": actual_sha,
         "size_bytes": len(body),
-        "scan_id": result["scan_id"],
-        "engine_version": None,
-        "signature_revision": None,
-        "findings": result["findings"],
+        "results": scanned["results"],
     }
     LOG.info("scan_result %s", json.dumps({k: payload[k] for k in (
-        *ID_FIELDS, "engine", "status", "reason", "sha256", "size_bytes", "scan_id"
+        *ID_FIELDS, "sha256", "size_bytes"
     )}, separators=(",", ":")))
+    for result in payload["results"]:
+        LOG.info("engine_result %s", json.dumps({k: result.get(k) for k in (
+            "engine", "status", "reason", "engine_version", "signature_revision", "profile", "elapsed_ms"
+        )}, separators=(",", ":")))
     return 200, payload
 
 
@@ -280,7 +404,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if len(body) != length:
                 self._reply(400, {"error": "incomplete_body"})
                 return
-            identifiers = {key: self.headers.get(f"X-MaMa-{key.title()}", "") for key in ID_FIELDS}
+            identifiers = {key: self.headers.get(f"X-MaMa-{HEADER_FIELDS[key]}", "") for key in ID_FIELDS}
             sha = self.headers.get("X-MaMa-Sha256", "")
             status, payload = scan_upload(body, identifiers, sha, self.server.backend,
                                           self.server.temp_root)  # type: ignore[attr-defined]
@@ -336,8 +460,27 @@ def main() -> None:
     event_root.mkdir(mode=0o770, parents=True, exist_ok=True)
     _set_imunify_group(request_root, 0o750)
     _set_imunify_group(event_root, 0o770)
-    backend = ImunifyCliBackend(os.environ.get("IMUNIFY_CLI", "/usr/bin/imunify-antivirus"),
-                                request_root, event_root)
+    engines: dict[str, ScannerBackend] = {}
+    if os.environ.get("ENABLE_CLAMAV", "false").lower() == "true":
+        engines["clamav"] = ClamAvBackend(os.environ.get("CLAMAV_SCAN_CLI", "/usr/bin/clamdscan"))
+    if os.environ.get("ENABLE_IMUNIFYAV", "false").lower() == "true":
+        engines["imunifyav"] = ImunifyCliBackend(os.environ.get("IMUNIFY_CLI", "/usr/bin/imunify-antivirus"),
+                                                  request_root, event_root)
+    if os.environ.get("ENABLE_PHP_MALWARE_SCANNER", "false").lower() == "true":
+        engines["php-malware-scanner"] = PhpMalwareScannerBackend(
+            os.environ.get("PHP_CLI", "/usr/bin/php"),
+            os.environ.get("PHP_MALWARE_SCANNER_SCRIPT", "/opt/mama-imunify/php-malware-scanner/scan.php"))
+    if not engines:
+        raise RuntimeError("no_scan_engines_enabled")
+    metadata = {
+        "clamav": {"engine_version": os.environ.get("CLAMAV_ENGINE_VERSION"),
+                   "signature_revision": os.environ.get("CLAMAV_SIGNATURE_REVISION")},
+        "imunifyav": {"engine_version": os.environ.get("IMUNIFYAV_ENGINE_VERSION"),
+                      "signature_revision": os.environ.get("IMUNIFYAV_SIGNATURE_REVISION")},
+        "php-malware-scanner": {"engine_version": os.environ.get("PHP_MALWARE_SCANNER_ENGINE_VERSION"),
+                                "signature_revision": os.environ.get("PHP_MALWARE_SCANNER_SIGNATURE_REVISION")},
+    }
+    backend = MultiEngineBackend(engines, metadata)
 
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     context.minimum_version = ssl.TLSVersion.TLSv1_2

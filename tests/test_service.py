@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from service import (BackendFailure, ClamAvBackend, ImunifyCliBackend, MultiEngineBackend,
-                     PhpMalwareScannerBackend, scan_upload)
+                     PhpMalwareScannerBackend, clear_tmpfs_directory, scan_upload)
 
 
 IDS = {"tenant": "1", "site": "2", "environment": "3", "batch": "4", "observation": "5",
@@ -87,6 +87,29 @@ class ScanUploadTest(unittest.TestCase):
         self.assertEqual((status, result["error"]), (413, "file_too_large"))
         self.assertIsNone(backend.seen_path)
         self.assertEqual(list(self.root.iterdir()), [])
+
+
+class StartupCleanupTest(unittest.TestCase):
+    def test_removes_stale_files_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory)
+            nested = root / "interrupted-request"
+            nested.mkdir()
+            (nested / "payload.bin").write_bytes(b"synthetic interrupted upload")
+            sentinel = Path(outside) / "must-remain"
+            sentinel.write_text("outside the scan root", encoding="utf-8")
+            link = root / "stale-link"
+            try:
+                link.symlink_to(sentinel)
+            except (OSError, NotImplementedError):
+                link = None
+
+            clear_tmpfs_directory(root)
+
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "outside the scan root")
+            if link is not None:
+                self.assertFalse(link.exists())
 
 
 class ResultNormalizationTest(unittest.TestCase):

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import tempfile
@@ -449,6 +450,15 @@ def require_tmpfs(path: Path) -> None:
         raise RuntimeError("scan_temp_not_tmpfs")
 
 
+def clear_tmpfs_directory(path: Path) -> None:
+    """Remove stale request/event artifacts without following symlinks."""
+    for entry in path.iterdir():
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(entry)
+
+
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -460,6 +470,8 @@ def main() -> None:
     event_root.mkdir(mode=0o770, parents=True, exist_ok=True)
     _set_imunify_group(request_root, 0o750)
     _set_imunify_group(event_root, 0o770)
+    clear_tmpfs_directory(request_root)
+    clear_tmpfs_directory(event_root)
     engines: dict[str, ScannerBackend] = {}
     if os.environ.get("ENABLE_CLAMAV", "false").lower() == "true":
         engines["clamav"] = ClamAvBackend(os.environ.get("CLAMAV_SCAN_CLI", "/usr/bin/clamdscan"))

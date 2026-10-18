@@ -52,7 +52,7 @@ class ClamAvBackend:
 
     def scan(self, path: Path) -> dict[str, Any]:
         try:
-            completed = subprocess.run([self.cli, "--fdpass", "--no-summary", "--infected", "--stdout", str(path)],
+            completed = subprocess.run([self.cli, "--stream", "--no-summary", "--infected", "--stdout", str(path)],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.timeout, check=False)
         except subprocess.TimeoutExpired as exc:
             raise BackendFailure("engine_timeout") from exc

@@ -130,7 +130,7 @@ class EngineAdapterTest(unittest.TestCase):
             result = ClamAvBackend().scan(path)
         self.assertEqual(result["findings"][0]["rule"], "Eicar-Test-Signature")
         self.assertNotIn(str(path), json.dumps(result))
-        self.assertIn("--fdpass", run.call_args.args[0])
+        self.assertIn("--stream", run.call_args.args[0])
         self.assertIn("--infected", run.call_args.args[0])
 
     def test_php_malware_scanner_parses_pattern_and_line_without_path(self):

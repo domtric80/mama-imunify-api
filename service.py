@@ -74,6 +74,8 @@ class ClamAvBackend:
                     findings.append({"rule": rule, "severity": "unknown", "line": None})
         if not findings:
             raise BackendFailure("invalid_scanner_result")
+        if any(item["rule"].startswith("Heuristics.Limits.Exceeded.") for item in findings):
+            return {"status": "not_evaluated", "reason": "engine_size_limit", "findings": []}
         return {"status": "infected", "findings": findings}
 
 

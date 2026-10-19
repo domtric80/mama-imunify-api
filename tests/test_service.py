@@ -156,6 +156,23 @@ class EngineAdapterTest(unittest.TestCase):
         self.assertIn("--stream", run.call_args.args[0])
         self.assertIn("--infected", run.call_args.args[0])
 
+    def test_clamav_limit_alert_is_not_evaluated(self):
+        path = Path("/run/mama-imunify/requests/scan-a/payload.bin")
+        for rule in (
+            "Heuristics.Limits.Exceeded.MaxFileSize",
+            "Heuristics.Limits.Exceeded.MaxFiles",
+            "Heuristics.Limits.Exceeded.MaxRecursion",
+        ):
+            completed = type("Completed", (), {"returncode": 1,
+                "stdout": f"{path}: {rule} FOUND\n", "stderr": ""})()
+            with self.subTest(rule=rule), patch("service.subprocess.run", return_value=completed):
+                result = ClamAvBackend().scan(path)
+            self.assertEqual(result, {
+                "status": "not_evaluated",
+                "reason": "engine_size_limit",
+                "findings": [],
+            })
+
     def test_php_malware_scanner_parses_pattern_and_line_without_path(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "payload.bin"

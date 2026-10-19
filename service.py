@@ -87,7 +87,7 @@ class PhpMalwareScannerBackend:
         if path.is_symlink() or not path.is_file():
             raise BackendFailure("invalid_scan_path")
         try:
-            completed = subprocess.run([self.php, self.script, "--", "-d", str(path.parent), "-E", "-k", "-w",
+            completed = subprocess.run([self.php, self.script, "-d", str(path.parent), "-E", "-k", "-w",
                 "-n", "-s", "-L", "-o", "%S|%P|%L", "--disable-stats"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=self.timeout, check=False)
         except subprocess.TimeoutExpired as exc:

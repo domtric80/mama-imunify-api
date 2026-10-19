@@ -164,7 +164,8 @@ class EngineAdapterTest(unittest.TestCase):
                 "stdout": "ER|synthetic-rule|12\n", "stderr": ""})()
             with patch("service.subprocess.run", return_value=completed) as run:
                 result = PhpMalwareScannerBackend("php", "scan.php").scan(path)
-        self.assertEqual(run.call_args.args[0][:3], ["php", "scan.php", "--"])
+        self.assertEqual(run.call_args.args[0][:3], ["php", "scan.php", "-d"])
+        self.assertNotIn("--", run.call_args.args[0][2:])
         self.assertIn("-L", run.call_args.args[0])
         self.assertEqual(result["findings"], [{"rule": "synthetic-rule", "severity": "unknown", "line": 12}])
 

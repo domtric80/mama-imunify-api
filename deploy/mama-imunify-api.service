@@ -1,6 +1,7 @@
 [Unit]
 Description=MaMa isolated antivirus scanner gateway
-After=network.target clamav-daemon.service
+After=network.target clamav-daemon.service run-mama\x2dimunify.mount
+Requires=run-mama\x2dimunify.mount
 RequiresMountsFor=/run/mama-imunify
 
 [Service]
@@ -8,10 +9,9 @@ Type=simple
 User=root
 Group=root
 SupplementaryGroups=clamav _imunify
-RuntimeDirectory=mama-imunify
-RuntimeDirectoryMode=0750
 EnvironmentFile=/etc/mama-imunify/gateway.env
 WorkingDirectory=/opt/mama-imunify/mama-imunify-api
+ExecStartPre=/usr/bin/python3 /opt/mama-imunify/mama-imunify-api/deploy/verify_runtime_mount.py
 ExecStartPre=/usr/bin/install -d -o root -g _imunify -m 0750 /run/mama-imunify/requests
 ExecStartPre=/usr/bin/install -d -o root -g _imunify -m 0770 /run/mama-imunify/events
 ExecStart=/usr/bin/python3 /opt/mama-imunify/mama-imunify-api/service.py

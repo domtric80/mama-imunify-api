@@ -44,6 +44,20 @@ class GatewayUnitTest(unittest.TestCase):
 
         self.assertFalse(valid)
         self.assertIn("not a mounted filesystem", reason)
+        run.assert_called_once_with(
+            [
+                "/usr/bin/findmnt",
+                "--noheadings",
+                "--raw",
+                "--output",
+                "FSTYPE,OPTIONS",
+                "--mountpoint",
+                "/run/mama-imunify",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
     @patch.object(
         VERIFY_RUNTIME_MOUNT.subprocess,
@@ -70,6 +84,19 @@ class GatewayUnitTest(unittest.TestCase):
         self.assertIn("nosuid", reason)
         self.assertIn("nodev", reason)
         self.assertIn("noexec", reason)
+
+    @patch.object(
+        VERIFY_RUNTIME_MOUNT.subprocess,
+        "run",
+        return_value=subprocess.CompletedProcess(
+            [], 0, "ext4 rw,nosuid,nodev,noexec\n", ""
+        ),
+    )
+    def test_non_tmpfs_mount_is_rejected_even_with_required_options(self, run):
+        valid, reason = VERIFY_RUNTIME_MOUNT.verify_mount()
+
+        self.assertFalse(valid)
+        self.assertIn("expected tmpfs", reason)
 
 
 if __name__ == "__main__":

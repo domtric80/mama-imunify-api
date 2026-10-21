@@ -1,0 +1,38 @@
+[Unit]
+Description=MaMa isolated antivirus scanner gateway
+After=network.target clamav-daemon.service
+RequiresMountsFor=/run/mama-imunify
+
+[Service]
+Type=simple
+User=root
+Group=root
+SupplementaryGroups=clamav _imunify
+EnvironmentFile=/etc/mama-imunify/gateway.env
+WorkingDirectory=/opt/mama-imunify/mama-imunify-api
+ExecStartPre=/usr/bin/install -d -o root -g _imunify -m 0750 /run/mama-imunify/requests
+ExecStartPre=/usr/bin/install -d -o root -g _imunify -m 0770 /run/mama-imunify/events
+ExecStart=/usr/bin/python3 /opt/mama-imunify/mama-imunify-api/service.py
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+ReadWritePaths=/run/mama-imunify
+CapabilityBoundingSet=CAP_CHOWN
+
+[Install]
+WantedBy=multi-user.target

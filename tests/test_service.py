@@ -6,14 +6,16 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from service import (BackendFailure, ClamAvBackend, ImunifyCliBackend, MultiEngineBackend,
                      PhpMalwareScannerBackend, clear_tmpfs_directory, parse_requested_engines,
-                     GatewayServer, scan_upload)
+                     GatewayServer, MAX_CONCURRENT_SCANS, REQUEST_QUEUE_SIZE, scan_upload)
 
 
 IDS = {"tenant": "1", "site": "2", "environment": "3", "batch": "4", "observation": "5",
@@ -294,6 +296,95 @@ class RequestedEnginesTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=2)
+
+
+class GatewayCapacityTest(unittest.TestCase):
+    def test_queue_is_explicitly_bounded_and_saturation_returns_retryable_429(self):
+        self.assertGreaterEqual(REQUEST_QUEUE_SIZE, 32)
+        self.assertLessEqual(REQUEST_QUEUE_SIZE, 256)
+        self.assertEqual(GatewayServer.request_queue_size, REQUEST_QUEUE_SIZE)
+        calls = []
+        class Engine:
+            def scan(self, path):
+                calls.append(path)
+                return {"status": "clean", "findings": []}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = GatewayServer(("127.0.0.1", 0), MultiEngineBackend({"clamav": Engine()}), root)
+            held_slots = 0
+            for _ in range(MAX_CONCURRENT_SCANS):
+                self.assertTrue(server.scan_slots.acquire(blocking=False))
+                held_slots += 1
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                body = b"synthetic"
+                headers = {**{f"X-MaMa-{key.replace('_', '-').title()}": value for key, value in IDS.items()},
+                    "X-MaMa-Sha256": hashlib.sha256(body).hexdigest(),
+                    "X-MaMa-Engines": "clamav", "Content-Type": "application/octet-stream"}
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request("POST", "/v1/scan", body=body, headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 429)
+                self.assertEqual(response.getheader("Retry-After"), "15")
+                self.assertEqual(json.loads(response.read()), {"error": "scanner_busy"})
+                self.assertEqual(calls, [])
+                self.assertEqual(list(root.iterdir()), [])
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                for _ in range(held_slots):
+                    server.scan_slots.release()
+
+    def test_concurrent_http_load_never_exceeds_scanner_limit_and_leaves_no_files(self):
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+        class SlowEngine:
+            def scan(self, path):
+                nonlocal active, maximum
+                with guard:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.12)
+                    return {"status": "clean", "findings": []}
+                finally:
+                    with guard:
+                        active -= 1
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = GatewayServer(("127.0.0.1", 0), MultiEngineBackend({"clamav": SlowEngine()}), root)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            barrier = threading.Barrier(8)
+            def request_one(index):
+                body = f"sample-{index}".encode()
+                headers = {**{f"X-MaMa-{key.replace('_', '-').title()}": value for key, value in IDS.items()},
+                    "X-MaMa-Sha256": hashlib.sha256(body).hexdigest(), "X-MaMa-Engines": "clamav",
+                    "Content-Type": "application/octet-stream"}
+                barrier.wait(timeout=2)
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                connection.request("POST", "/v1/scan", body=body, headers=headers)
+                response = connection.getresponse()
+                status = response.status
+                response.read()
+                connection.close()
+                return status
+            try:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    statuses = list(pool.map(request_one, range(8)))
+                self.assertTrue(all(status in (200, 429) for status in statuses), statuses)
+                self.assertIn(200, statuses)
+                self.assertLessEqual(maximum, MAX_CONCURRENT_SCANS)
+                self.assertEqual(active, 0)
+                self.assertEqual(list(root.iterdir()), [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

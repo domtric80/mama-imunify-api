@@ -121,9 +121,10 @@ class MultiEngineBackend:
         self.engines = engines
         self.metadata = metadata or {}
 
-    def scan(self, path: Path) -> dict[str, Any]:
+    def scan(self, path: Path, requested_engines: list[str]) -> dict[str, Any]:
         results = []
-        for name, backend in self.engines.items():
+        for name in requested_engines:
+            backend = self.engines[name]
             started = time.monotonic()
             try:
                 result = backend.scan(path)
@@ -289,7 +290,7 @@ def _set_imunify_group(path: Path, mode: int) -> None:
 
 
 def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
-                backend: ScannerBackend, temp_root: Path,
+                backend: ScannerBackend, temp_root: Path, requested_engines: list[str],
                 max_bytes: int = MAX_FILE_BYTES) -> tuple[int, dict[str, Any]]:
     if any(not ID_RE.fullmatch(identifiers.get(key, "")) for key in ID_FIELDS):
         return 400, {"error": "invalid_identifiers"}
@@ -308,7 +309,7 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
     file_path: Path | None = None
     scanned: dict[str, Any] = {"results": []}
     def failed_results(reason: str) -> list[dict[str, Any]]:
-        names = list(backend.engines) if isinstance(backend, MultiEngineBackend) else ["unknown"]
+        names = requested_engines
         return [{"engine": name, "status": "not_evaluated", "reason": reason, "findings": [],
                  "engine_version": None, "signature_revision": None, "profile": "mama-node-v1",
                  "elapsed_ms": None} for name in names]
@@ -322,7 +323,10 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
             output.flush()
             os.fsync(output.fileno())
         try:
-            scanned = backend.scan(file_path)
+            if isinstance(backend, MultiEngineBackend):
+                scanned = backend.scan(file_path, requested_engines)
+            else:
+                scanned = backend.scan(file_path)
         except BackendFailure as exc:
             scanned = {"results": failed_results(exc.reason)}
         except Exception:
@@ -383,6 +387,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if self.path != "/v1/scan":
             self._reply(404, {"error": "not_found"})
             return
+        requested_engines = parse_requested_engines(
+            self.headers.get("X-MaMa-Engines"), self.server.backend.engines  # type: ignore[attr-defined]
+        )
+        if requested_engines is None:
+            self._reply(400, {"error": "invalid_engines"})
+            return
         if self.headers.get("Transfer-Encoding"):
             self._reply(400, {"error": "transfer_encoding_not_supported"})
             return
@@ -410,7 +420,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             identifiers = {key: self.headers.get(f"X-MaMa-{HEADER_FIELDS[key]}", "") for key in ID_FIELDS}
             sha = self.headers.get("X-MaMa-Sha256", "")
             status, payload = scan_upload(body, identifiers, sha, self.server.backend,
-                                          self.server.temp_root)  # type: ignore[attr-defined]
+                                          self.server.temp_root, requested_engines)  # type: ignore[attr-defined]
             self._reply(status, payload)
         finally:
             self.server.scan_slots.release()  # type: ignore[attr-defined]
@@ -429,6 +439,19 @@ class GatewayServer(ThreadingHTTPServer):
         request, address = super().get_request()
         request.settimeout(REQUEST_TIMEOUT_SECONDS)
         return request, address
+
+
+def parse_requested_engines(value: str | None, enabled_engines: dict[str, ScannerBackend]) -> list[str] | None:
+    """Require an explicit, ordered subset of configured engines; never default to all."""
+    if value is None or not value:
+        return None
+    engines = value.split(",")
+    if any(not engine or engine != engine.strip() or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", engine)
+           for engine in engines):
+        return None
+    if len(engines) != len(set(engines)) or any(engine not in enabled_engines for engine in engines):
+        return None
+    return engines
 
 
 def require_tmpfs(path: Path) -> None:

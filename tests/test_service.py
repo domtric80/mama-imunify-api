@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from service import (BackendFailure, ClamAvBackend, ImunifyCliBackend, MultiEngineBackend,
-                     PhpMalwareScannerBackend, clear_tmpfs_directory, scan_upload)
+                     PhpMalwareScannerBackend, clear_tmpfs_directory, parse_requested_engines,
+                     GatewayServer, scan_upload)
 
 
 IDS = {"tenant": "1", "site": "2", "environment": "3", "batch": "4", "observation": "5",
@@ -44,7 +47,7 @@ class ScanUploadTest(unittest.TestCase):
 
     def test_clean_result_deletes_uploaded_file_and_directory(self):
         backend = FakeBackend()
-        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root)
+        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root, ["clamav"])
         self.assertEqual(status, 200)
         self.assertEqual(result["results"][0]["status"], "no_findings")
         self.assertEqual(result["results"][0]["engine"], "clamav")
@@ -57,7 +60,7 @@ class ScanUploadTest(unittest.TestCase):
         backend = FakeBackend({"results": [{"engine": "clamav", "status": "findings", "reason": None,
             "findings": [{"rule": "EICAR-Test", "severity": "unknown", "line": None}],
             "engine_version": None, "signature_revision": None, "profile": "mama-node-v1", "elapsed_ms": 1}]})
-        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root)
+        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root, ["clamav"])
         self.assertEqual(status, 200)
         self.assertEqual(result["results"][0]["findings"][0]["rule"], "EICAR-Test")
         self.assertNotIn("path", json.dumps(result))
@@ -65,7 +68,7 @@ class ScanUploadTest(unittest.TestCase):
 
     def test_backend_timeout_fails_closed_and_deletes_file(self):
         backend = FakeBackend(failure=BackendFailure("engine_timeout"))
-        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root)
+        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root, ["clamav"])
         self.assertEqual(status, 200)
         self.assertEqual(result["results"][0]["status"], "not_evaluated")
         self.assertEqual(result["results"][0]["reason"], "engine_timeout")
@@ -73,17 +76,17 @@ class ScanUploadTest(unittest.TestCase):
 
     def test_bad_hash_and_invalid_ids_are_rejected_before_scan(self):
         backend = FakeBackend()
-        status, result = scan_upload(self.body, IDS, "0" * 64, backend, self.root)
+        status, result = scan_upload(self.body, IDS, "0" * 64, backend, self.root, ["clamav"])
         self.assertEqual((status, result["error"]), (422, "sha256_mismatch"))
         bad_ids = {**IDS, "site": "../2"}
-        status, result = scan_upload(self.body, bad_ids, self.sha, backend, self.root)
+        status, result = scan_upload(self.body, bad_ids, self.sha, backend, self.root, ["clamav"])
         self.assertEqual((status, result["error"]), (400, "invalid_identifiers"))
         self.assertIsNone(backend.seen_path)
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_oversize_upload_never_reaches_backend(self):
         backend = FakeBackend()
-        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root, max_bytes=4)
+        status, result = scan_upload(self.body, IDS, self.sha, backend, self.root, ["clamav"], max_bytes=4)
         self.assertEqual((status, result["error"]), (413, "file_too_large"))
         self.assertIsNone(backend.seen_path)
         self.assertEqual(list(self.root.iterdir()), [])
@@ -211,8 +214,8 @@ class EngineAdapterTest(unittest.TestCase):
             "imunifyav": Engine(),
             "php-malware-scanner": Engine(),
         })
-        result = suite.scan(Path("synthetic"))["results"]
-        self.assertEqual([item["engine"] for item in result], ["clamav", "imunifyav", "php-malware-scanner"])
+        result = suite.scan(Path("synthetic"), ["clamav", "php-malware-scanner"])["results"]
+        self.assertEqual([item["engine"] for item in result], ["clamav", "php-malware-scanner"])
         self.assertEqual(result[0]["status"], "not_evaluated")
         self.assertEqual(result[0]["reason"], "engine_unavailable")
         self.assertEqual(result[1]["status"], "no_findings")
@@ -220,9 +223,77 @@ class EngineAdapterTest(unittest.TestCase):
     def test_signature_metadata_is_returned_when_configured(self):
         suite = MultiEngineBackend({"clamav": FakeBackend()}, {"clamav": {
             "engine_version": "1.2.3", "signature_revision": "456"}})
-        result = suite.scan(Path("synthetic"))["results"][0]
+        result = suite.scan(Path("synthetic"), ["clamav"])["results"][0]
         self.assertEqual(result["engine_version"], "1.2.3")
         self.assertEqual(result["signature_revision"], "456")
+
+
+class RequestedEnginesTest(unittest.TestCase):
+    def setUp(self):
+        self.enabled = {"clamav": FakeBackend(), "php-malware-scanner": FakeBackend()}
+
+    def test_requires_explicit_nonempty_known_enabled_ordered_list(self):
+        for value in (None, "", "clamav,", ",clamav", "clamav,clamav", "clamav,unknown",
+                      "clamav, imunifyav", "clamav\r\nX-Evil:yes"):
+            with self.subTest(value=value):
+                self.assertIsNone(parse_requested_engines(value, self.enabled))
+        self.assertEqual(parse_requested_engines("php-malware-scanner,clamav", self.enabled),
+                         ["php-malware-scanner", "clamav"])
+
+    def test_backend_runs_only_requested_engines_in_requested_order(self):
+        calls = []
+        class Engine:
+            def __init__(self, name):
+                self.name = name
+            def scan(self, path):
+                calls.append(self.name)
+                return {"status": "clean", "findings": []}
+        suite = MultiEngineBackend({name: Engine(name) for name in self.enabled})
+        results = suite.scan(Path("synthetic"), ["php-malware-scanner"])["results"]
+        self.assertEqual(calls, ["php-malware-scanner"])
+        self.assertEqual([item["engine"] for item in results], ["php-malware-scanner"])
+
+    def test_http_rejects_bad_selection_before_body_read_or_staging(self):
+        calls = []
+        class Engine:
+            def scan(self, path):
+                calls.append(path)
+                return {"status": "clean", "findings": []}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MultiEngineBackend({"clamav": Engine(), "php-malware-scanner": Engine()})
+            server = GatewayServer(("127.0.0.1", 0), backend, root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request("POST", "/v1/scan", body=b"synthetic",
+                    headers={"Content-Length": "9", "Content-Type": "application/octet-stream"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 400)
+                self.assertEqual(json.loads(response.read()), {"error": "invalid_engines"})
+                connection.close()
+                self.assertEqual(calls, [])
+                self.assertEqual(list(root.iterdir()), [])
+
+                body = b"synthetic"
+                headers = {**{f"X-MaMa-{key.replace('_', '-').title()}": value for key, value in IDS.items()},
+                    "X-MaMa-Sha256": hashlib.sha256(body).hexdigest(),
+                    "X-MaMa-Engines": "php-malware-scanner",
+                    "Content-Type": "application/octet-stream"}
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request("POST", "/v1/scan", body=body, headers=headers)
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertEqual([item["engine"] for item in payload["results"]], ["php-malware-scanner"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(list(root.iterdir()), [])
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":

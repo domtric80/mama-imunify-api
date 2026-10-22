@@ -296,8 +296,6 @@ def scan_upload(body: bytes, identifiers: dict[str, str], expected_sha: str,
         return 400, {"error": "invalid_identifiers"}
     if not SHA_RE.fullmatch(expected_sha):
         return 400, {"error": "invalid_sha256"}
-    if not body:
-        return 400, {"error": "empty_file"}
     if len(body) > max_bytes:
         return 413, {"error": "file_too_large"}
 
@@ -400,7 +398,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
             length = -1
-        if length <= 0:
+        if length < 0:
             self._reply(400, {"error": "invalid_content_length"})
             return
         if length > MAX_FILE_BYTES:

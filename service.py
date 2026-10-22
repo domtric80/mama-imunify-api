@@ -28,6 +28,7 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(32 * 1024 * 1024)))
 SCAN_TIMEOUT_SECONDS = int(os.environ.get("SCAN_TIMEOUT_SECONDS", "180"))
 START_TIMEOUT_SECONDS = int(os.environ.get("START_TIMEOUT_SECONDS", "20"))
 MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("MAX_CONCURRENT_SCANS", "2")))
+REQUEST_QUEUE_SIZE = max(5, min(256, int(os.environ.get("REQUEST_QUEUE_SIZE", "64"))))
 REQUEST_TIMEOUT_SECONDS = int(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SHA_RE = re.compile(r"^[a-f0-9]{64}$")
@@ -371,6 +372,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if status == 429:
+            self.send_header("Retry-After", "15")
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
@@ -408,7 +411,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._reply(415, {"error": "unsupported_media_type"})
             return
         if not self.server.scan_slots.acquire(blocking=False):  # type: ignore[attr-defined]
-            self._reply(503, {"error": "scanner_busy"})
+            self._reply(429, {"error": "scanner_busy"})
             return
         try:
             body = self.rfile.read(length)
@@ -426,6 +429,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 class GatewayServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = REQUEST_QUEUE_SIZE
 
     def __init__(self, address: tuple[str, int], backend: ScannerBackend, temp_root: Path):
         super().__init__(address, ApiHandler)

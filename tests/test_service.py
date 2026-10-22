@@ -91,6 +91,63 @@ class ScanUploadTest(unittest.TestCase):
         self.assertIsNone(backend.seen_path)
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def test_empty_payload_with_matching_sha_is_scanned_and_cleaned(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        suite = MultiEngineBackend({
+            "clamav": ClamAvBackend(),
+            "php-malware-scanner": PhpMalwareScannerBackend("php", "scan.php"),
+        })
+        empty_sha = hashlib.sha256(b"").hexdigest()
+
+        with patch("service.subprocess.run", return_value=completed) as scanner_run:
+            status, result = scan_upload(b"", IDS, empty_sha, suite, self.root,
+                                         ["clamav", "php-malware-scanner"])
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result["size_bytes"], 0)
+        self.assertEqual(result["sha256"], empty_sha)
+        self.assertEqual([item["status"] for item in result["results"]], ["no_findings", "no_findings"])
+        self.assertEqual(scanner_run.call_count, 2)
+        self.assertIn("clamdscan", scanner_run.call_args_list[0].args[0][0])
+        self.assertEqual(scanner_run.call_args_list[1].args[0][:2], ["php", "scan.php"])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_http_accepts_zero_content_length_and_scans_only_requested_engines(self):
+        calls = []
+        class Engine:
+            def __init__(self, name):
+                self.name = name
+            def scan(self, path):
+                calls.append((self.name, path.stat().st_size))
+                return {"status": "clean", "findings": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = MultiEngineBackend({"clamav": Engine("clamav"),
+                                          "php-malware-scanner": Engine("php-malware-scanner")})
+            server = GatewayServer(("127.0.0.1", 0), backend, root)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                headers = {**{f"X-MaMa-{key.replace('_', '-').title()}": value for key, value in IDS.items()},
+                    "X-MaMa-Sha256": hashlib.sha256(b"").hexdigest(),
+                    "X-MaMa-Engines": "php-malware-scanner", "Content-Length": "0",
+                    "Content-Type": "application/octet-stream"}
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request("POST", "/v1/scan", body=b"", headers=headers)
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["size_bytes"], 0)
+                self.assertEqual([item["engine"] for item in payload["results"]], ["php-malware-scanner"])
+                self.assertEqual(calls, [("php-malware-scanner", 0)])
+                self.assertEqual(list(root.iterdir()), [])
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
 
 class StartupCleanupTest(unittest.TestCase):
     def test_removes_stale_files_without_following_symlinks(self):
